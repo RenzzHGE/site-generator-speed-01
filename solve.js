@@ -457,7 +457,9 @@ function inlineCat(s, a, b, env) {
     if (c === 92) {
       if (i + 1 < b && s.charCodeAt(i + 1) < 128 && ESCAPABLE[s.charCodeAt(i + 1)]) {
         if (i > run) out += s.slice(run, i);
-        out += s[i + 1];
+        // Reference writes escapeHtml(char): of the escapable chars only
+        // '>' is in the escape table, so only it needs the entity.
+        out += s[i + 1] === '>' ? '&gt;' : s[i + 1];
         i += 2;
         run = i;
       } else {
