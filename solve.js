@@ -19,6 +19,14 @@
 // BUILD-V5.md); escStr fast path is one regex test; slugify ASCII path is
 // run-based and single-pass (bails to the NFKD path on first non-ASCII
 // char); fence code blocks escape via escStr instead of escInto.
+// v6 optimisations over v5: renderMarkdown lines are pre-split into
+// start/end arrays once (peek is an array read, next a counter bump — no
+// per-line indexOf or peek cache); front matter is scanned in two passes
+// with no per-line arrays; multi-line paragraphs render the raw source
+// span directly when no line needed trimming (no parts array / join copy).
+// A per-run link cache was tried and REVERTED: it measured slower on the
+// heat driver (only ~26% of links repeat; the concat + Map ops on every
+// call cost more than the hits saved).
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
   'August', 'September', 'October', 'November', 'December'];
@@ -248,23 +256,28 @@ function parseFrontMatter(text) {
   let closeStart = -1;
   let closeEnd = -1;
   let lineNo = 2;
-  const starts = [];
-  const ends = [];
-  while (pos <= text.length) {
-    const nl = text.indexOf('\n', pos);
+  // Pass 1: find the closing '---' line (no per-line allocation).
+  let p = pos;
+  while (p <= text.length) {
+    const nl = text.indexOf('\n', p);
     const end = nl === -1 ? text.length : nl;
-    if (text.slice(pos, end) === '---') { closeLine = lineNo; closeStart = pos; closeEnd = end; break; }
-    starts.push(pos);
-    ends.push(end);
+    if (end - p === 3 && text.charCodeAt(p) === 45 && text.charCodeAt(p + 1) === 45 && text.charCodeAt(p + 2) === 45) {
+      closeLine = lineNo; closeStart = p; closeEnd = end; break;
+    }
     if (nl === -1) break;
-    pos = nl + 1;
+    p = nl + 1;
     lineNo++;
   }
   if (closeLine === -1) return { error: 'the front matter is not closed' };
   const data = {};
-  for (let k = 0; k < starts.length; k++) {
-    const line = text.slice(starts[k], ends[k]);
-    const lineNo = k + 2;
+  // Pass 2: process the lines between the fences, re-scanning (same error
+  // order as before: a missing close beats any bad key line).
+  p = pos;
+  lineNo = 2;
+  while (p < closeStart) {
+    const nl = text.indexOf('\n', p);
+    const end = nl === -1 ? text.length : nl;
+    const line = text.slice(p, end);
     let blank = true;
     for (let i = 0; i < line.length; i++) {
       const c = line.charCodeAt(i);
@@ -297,6 +310,9 @@ function parseFrontMatter(text) {
       if ('error' in v) return v;
       data[key] = v.value;
     }
+    if (nl === -1) break;
+    p = nl + 1;
+    lineNo++;
   }
   if (!hasOwn(data, 'title')) return { error: 'no title' };
   const body = closeEnd === text.length ? '' : text.slice(closeEnd + 1);
@@ -539,27 +555,30 @@ function renderMarkdown(src, env, slugMemo) {
   const toc = [];
   let excerpt = null;
   const n = src.length;
-  let pos = 0;
-  let pkA = -1, pkB = -1; // cached peekLine() range, or -1
+  // Line starts/ends, built once in a tight scan: the lines are exactly
+  // src.split('\n') ranges, so peek is an array read and next is a counter
+  // bump (no indexOf per line, no peek cache).
+  const ls = [], le = [];
+  {
+    let p = 0;
+    for (;;) {
+      const nl = src.indexOf('\n', p);
+      if (nl === -1) { ls.push(p); le.push(n); break; }
+      ls.push(p); le.push(nl); p = nl + 1;
+      if (p === n) { ls.push(n); le.push(n); break; }
+    }
+  }
+  let li = 0;
   let la = 0, lb = 0;     // current line range
   const words = countWords(src);
   const nextLine = () => {
-    if (pkA !== -1) { la = pkA; lb = pkB; pkA = -1; return true; }
-    if (pos > n) return false;
-    if (pos === n) { la = n; lb = n; pos = n + 1; return true; }
-    const nl = src.indexOf('\n', pos);
-    if (nl === -1) { la = pos; lb = n; pos = n + 1; }
-    else { la = pos; lb = nl; pos = nl + 1; }
+    if (li >= ls.length) return false;
+    la = ls[li]; lb = le[li]; li++;
     return true;
   };
   const peekLine = () => {
-    if (pkA !== -1) { la = pkA; lb = pkB; return true; }
-    if (pos > n) return false;
-    if (pos === n) { la = n; lb = n; return true; }
-    const nl = src.indexOf('\n', pos);
-    if (nl === -1) { pkA = pos; pkB = n; pos = n + 1; }
-    else { pkA = pos; pkB = nl; pos = nl + 1; }
-    la = pkA; lb = pkB;
+    if (li >= ls.length) return false;
+    la = ls[li]; lb = le[li];
     return true;
   };
   while (true) {
@@ -683,17 +702,23 @@ function renderMarkdown(src, env, slugMemo) {
     }
     const pa = [], pb = [];
     trimR(src, la, lb);
+    let pTrim = _ta > la || _tb < lb;
     pa.push(_ta); pb.push(_tb);
     while (true) {
       if (!peekLine()) break;
       if (endsParagraph(src, la, lb)) break;
       nextLine();
       trimR(src, la, lb);
+      if (_ta > la || _tb < lb) pTrim = true;
       pa.push(_ta); pb.push(_tb);
     }
     let html;
     if (pa.length === 1) {
       html = inlineStrR(src, pa[0], pb[0], env);
+    } else if (!pTrim) {
+      // Untrimmed consecutive lines: the raw span is exactly the lines
+      // joined by '\n' (no parts array, no join copy).
+      html = inlineStrR(src, pa[0], pb[pb.length - 1], env);
     } else {
       const parts = [];
       for (let k = 0; k < pa.length; k++) parts.push(src.slice(pa[k], pb[k]));
