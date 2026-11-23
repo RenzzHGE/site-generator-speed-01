@@ -1,14 +1,18 @@
-// site-generator-speed-01 entry B v3: fast reimplementation of makefun-site 1.0.0.
+// site-generator-speed-01 entry B v4: fast reimplementation of makefun-site 1.0.0.
 // Dependency-free ES module. Strategies: template codegen via `new Function`
 // (string-concat accumulator; flat op-list interpreter fallback if codegen
 // ever throws), single-pass Markdown over index ranges, hand-scanned front
 // matter, memoised slugify. v3 optimisations over v2: inline rendering via a
 // single-scan string-concat scanner (inlineCat), range-based (slice-free)
-// line handling in renderMarkdown with the word count fused into line
-// extraction, an indexOf fast path in escStr for short strings, and
-// include-output caching (constant templates cached per depth; templates
-// reading one loop var cached per that var's value) driven by a conservative
-// static dependency analysis (analyzeDeps/includePlan).
+// line handling in renderMarkdown, an indexOf fast path in escStr for short
+// strings, and include-output caching (constant templates cached per depth;
+// templates reading one loop var cached per that var's value) driven by a
+// conservative static dependency analysis (analyzeDeps/includePlan).
+// v4 optimisations over v3: word count as one whole-body pass (countWords,
+// exact for the full \s set, no per-line closure calls); include calls
+// factored into a shared runtime helper (incTpl) so `new Function` compiles
+// less code; only reachable templates are compiled (reachableTemplates over
+// kept layouts + index/tag/tags and their transitive includes).
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
   'August', 'September', 'October', 'November', 'December'];
@@ -511,9 +515,26 @@ function inlineCat(s, a, b, env) {
   return out;
 }
 
+/** Words of a body: runs of non-whitespace (reference wordsOf, exact for
+ *  the full \s set). One whole-body pass: ASCII chars take the `c > 32`
+ *  lane; the unicode-space check runs only for c >= 128 (rare). */
+function countWords(src) {
+  let words = 0, prevWs = true;
+  for (let i = 0; i < src.length; i++) {
+    const c = src.charCodeAt(i);
+    if (c > 32) {
+      if (c < 128) { if (prevWs) { words++; prevWs = false; } }
+      else if (c === 0xa0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff) prevWs = true;
+      else if (prevWs) { words++; prevWs = false; }
+    } else if (c === 32 || (c >= 9 && c <= 13)) prevWs = true;
+    else if (prevWs) { words++; prevWs = false; }
+  }
+  return words;
+}
+
 /** Render Markdown: { html, toc, excerpt, words } (reference renderMarkdown).
  *  Lines are index ranges [la, lb) of src — no per-line substrings.
- *  Word count is fused into line extraction (one pass over the body). */
+ *  Word count is one whole-body pass up front (countWords). */
 function renderMarkdown(src, env, slugMemo) {
   const ids = new Set();
   const blocks = [];
@@ -523,25 +544,7 @@ function renderMarkdown(src, env, slugMemo) {
   let pos = 0;
   let pkA = -1, pkB = -1; // cached peekLine() range, or -1
   let la = 0, lb = 0;     // current line range
-  let words = 0, prevWs = true;
-  // Count words (runs of non-whitespace) in s[a..b); the '\n' after the
-  // line is whitespace, so prevWs resets after every line. Exact for the
-  // full \s set: ASCII fast lanes, unicode spaces only for c >= 128.
-  const countRange = (a, b) => {
-    for (let i = a; i < b; i++) {
-      const c = src.charCodeAt(i);
-      if (c < 33) {
-        if (c === 32 || (c >= 9 && c <= 13)) prevWs = true;
-        else if (prevWs) { words++; prevWs = false; }
-      } else if (c < 128) {
-        if (prevWs) words++;
-        prevWs = false;
-      } else if (c === 0xa0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff) {
-        prevWs = true;
-      } else if (prevWs) { words++; prevWs = false; }
-    }
-    prevWs = true;
-  };
+  const words = countWords(src);
   const nextLine = () => {
     if (pkA !== -1) { la = pkA; lb = pkB; pkA = -1; return true; }
     if (pos > n) return false;
@@ -549,7 +552,6 @@ function renderMarkdown(src, env, slugMemo) {
     const nl = src.indexOf('\n', pos);
     if (nl === -1) { la = pos; lb = n; pos = n + 1; }
     else { la = pos; lb = nl; pos = nl + 1; }
-    countRange(la, lb);
     return true;
   };
   const peekLine = () => {
@@ -560,7 +562,6 @@ function renderMarkdown(src, env, slugMemo) {
     if (nl === -1) { pkA = pos; pkB = n; pos = n + 1; }
     else { pkA = pos; pkB = nl; pos = nl + 1; }
     la = pkA; lb = pkB;
-    countRange(pkA, pkB);
     return true;
   };
   while (true) {
@@ -876,6 +877,61 @@ function includePlan(parsed, name, boundArr) {
   return null;
 }
 
+/** Include call with output caching (see includePlan). plan: 0 = no cache,
+ *  1 = cache per depth (run-constants only), 2 = cache per (key value, depth).
+ *  Factored out of the generated code so `new Function` compiles less code. */
+function incTpl(T, nm, plan, key, V, L, depth, esc, txt, tru, pr, has, C, inc) {
+  if (depth >= 8) return '';
+  const f = T[nm];
+  if (f === undefined) return '';
+  if (plan === 0) return f(V, L, depth + 1, T, esc, txt, tru, pr, has, C, inc);
+  let m = C[nm];
+  if (m === undefined) m = C[nm] = new Map();
+  if (plan === 1) {
+    let s = m.get(depth);
+    if (s === undefined) { s = f(V, L, depth + 1, T, esc, txt, tru, pr, has, C, inc); m.set(depth, s); }
+    return s;
+  }
+  const k = L[key];
+  let d = m.get(k);
+  if (d === undefined) {
+    const s = f(V, L, depth + 1, T, esc, txt, tru, pr, has, C, inc);
+    m.set(k, new Map([[depth, s]]));
+    return s;
+  }
+  let s = d.get(depth);
+  if (s === undefined) { s = f(V, L, depth + 1, T, esc, txt, tru, pr, has, C, inc); d.set(depth, s); }
+  return s;
+}
+
+/** Templates reachable from `roots` via transitive includes (parsed trees).
+ *  Only these can ever render, so only these need compiling; the rest are
+ *  parsed (for the layout-exists check and the dependency analysis) but
+ *  never compiled. */
+function reachableTemplates(parsed, roots) {
+  const seen = new Set();
+  const stack = [];
+  for (const r of roots) if (parsed[r] !== undefined) stack.push(r);
+  const walk = (list) => {
+    for (const n of list) {
+      if (n.kind === 'include') {
+        if (parsed[n.name] !== undefined && !seen.has(n.name)) stack.push(n.name);
+      } else if (n.kind === 'for') walk(n.body);
+      else if (n.kind === 'if') {
+        walk(n.then);
+        if (n.else !== null) walk(n.else);
+      }
+    }
+  };
+  while (stack.length > 0) {
+    const n = stack.pop();
+    if (seen.has(n)) continue;
+    seen.add(n);
+    walk(parsed[n]);
+  }
+  return seen;
+}
+
 /** Codegen: compile a node tree to a function (V, L, out, depth, T). */
 function compileTemplate(nodes, parsed) {
   let uid = 0;
@@ -927,16 +983,9 @@ function compileTemplate(nodes, parsed) {
       } else if (n.kind === 'include') {
         const plan = includePlan(parsed, n.name, bound);
         const nm = JSON.stringify(n.name);
-        if (plan === null) {
-          code.push('if(depth<8){const __f=T[' + nm + '];if(__f)s+=__f(V,L,depth+1,T,esc,txt,tru,pr,has,C);}');
-        } else if (plan.kind === 'const') {
-          // Output depends only on run-constants: cache per (template, depth).
-          code.push('if(depth<8){const __f=T[' + nm + '];if(__f){let __m=C[' + nm + '];if(!__m)__m=C[' + nm + ']=new Map();let __s=__m.get(depth);if(__s===undefined){__s=__f(V,L,depth+1,T,esc,txt,tru,pr,has,C);__m.set(depth,__s);}s+=__s;}}');
-        } else {
-          // Output depends only on run-constants + one loop var: cache per (var value, depth).
-          const kv = JSON.stringify(plan.key);
-          code.push('if(depth<8){const __f=T[' + nm + '];if(__f){let __m=C[' + nm + '];if(!__m)__m=C[' + nm + ']=new Map();const __k=L[' + kv + '];let __d=__m.get(__k);let __s;if(__d===undefined){__s=__f(V,L,depth+1,T,esc,txt,tru,pr,has,C);__m.set(__k,new Map([[depth,__s]]));}else{__s=__d.get(depth);if(__s===undefined){__s=__f(V,L,depth+1,T,esc,txt,tru,pr,has,C);__d.set(depth,__s);}}s+=__s;}}');
-        }
+        const pk = plan === null ? '0' : plan.kind === 'const' ? '1' : '2';
+        const kk = plan !== null && plan.kind === 'key' ? JSON.stringify(plan.key) : '0';
+        code.push('s+=__inc(T,' + nm + ',' + pk + ',' + kk + ',V,L,depth,esc,txt,tru,pr,has,C,__inc);');
       }
     }
   };
@@ -944,7 +993,7 @@ function compileTemplate(nodes, parsed) {
   gen(nodes, [], code);
   code.push('return s;');
   const src = code.join('');
-  return new Function('V', 'L', 'depth', 'T', 'esc', 'txt', 'tru', 'pr', 'has', 'C', src);
+  return new Function('V', 'L', 'depth', 'T', 'esc', 'txt', 'tru', 'pr', 'has', 'C', '__inc', src);
 }
 
 /** Fallback interpreter over the node tree (used only if codegen throws). */
@@ -981,7 +1030,7 @@ function renderNodesFb(nodes, V, L, out, depth, T, C) {
     } else if (n.kind === 'include') {
       const t = T[n.name];
       if (t !== undefined && depth < INCLUDE_DEPTH) {
-        if (typeof t === 'function') out.push(t(V, L, depth + 1, T, escStr, textOf, truthy, pr, hasOwn, C));
+        if (typeof t === 'function') out.push(t(V, L, depth + 1, T, escStr, textOf, truthy, pr, hasOwn, C, incTpl));
         else renderNodesFb(t.nodes, V, L, out, depth + 1, T, C);
       }
     }
@@ -1028,20 +1077,13 @@ export function run(input) {
       report.push(err.message);
     }
   }
-  for (const name of Object.keys(parsed).sort(byCodeUnits)) {
-    try {
-      templates[name] = compileTemplate(parsed[name], parsed);
-    } catch (e) {
-      templates[name] = { nodes: parsed[name] };
-    }
-  }
   // Per-run include-output cache (never shared across cases).
   const incCache = Object.create(null);
   const render = (name, V) => {
     const t = templates[name];
     if (t === undefined) return null;
     const L = Object.create(null);
-    if (typeof t === 'function') return t(V, L, 0, templates, escStr, textOf, truthy, pr, hasOwn, incCache);
+    if (typeof t === 'function') return t(V, L, 0, templates, escStr, textOf, truthy, pr, hasOwn, incCache, incTpl);
     const out = [];
     renderNodesFb(t.nodes, V, L, out, 0, templates, incCache);
     return out.join('');
@@ -1079,7 +1121,7 @@ export function run(input) {
       continue;
     }
     const layout = s.data.layout !== undefined ? s.data.layout : (s.post ? 'post' : 'page');
-    if (templates[layout] === undefined) {
+    if (parsed[layout] === undefined) {
       report.push('refused ' + s.path + ': layout "' + layout + '" is no template that parses');
       continue;
     }
@@ -1089,6 +1131,21 @@ export function run(input) {
       continue;
     }
     kept.push(s);
+  }
+
+  // Compile only the templates that can render: the kept sources' layouts
+  // plus index/tag/tags, and their transitive includes. The rest are parsed
+  // (for the layout check above and the dependency analysis) but never
+  // compiled; render() never asks for them.
+  const roots = ['index', 'tag', 'tags'];
+  for (const s of kept) roots.push(s.layout);
+  const reachable = reachableTemplates(parsed, roots);
+  for (const name of [...reachable].sort(byCodeUnits)) {
+    try {
+      templates[name] = compileTemplate(parsed[name], parsed);
+    } catch (e) {
+      templates[name] = { nodes: parsed[name] };
+    }
   }
 
   const taken = new Map();
