@@ -1,26 +1,26 @@
-// site-generator-speed-01 entry B: fast reimplementation of makefun-site 1.0.0.
+// site-generator-speed-01 entry B v2: fast reimplementation of makefun-site 1.0.0.
 // Dependency-free ES module. Strategies: template codegen via `new Function`
-// (flat op-list interpreter fallback if codegen ever throws), single-pass
-// Markdown over index ranges, hand-scanned front matter, memoised slugify.
+// (string-concat accumulator; flat op-list interpreter fallback if codegen
+// ever throws), single-pass Markdown over index ranges, hand-scanned front
+// matter, memoised slugify. v2 optimisations over v1: regex-jump escape and
+// inline scanners, indexOf-based emphasis/link search, word-count via
+// /\s\S/ transitions, first-char dispatch in the Markdown block loop,
+// peek-line cache, single-scan front matter, `toc: s.toc` (identical shape).
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
   'August', 'September', 'October', 'November', 'December'];
 const hasOwn = Object.hasOwn;
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
+const ESC_RE = /[&<>"']/g;
+
 /** HTML-escape `s` to a new string. */
 export function escStr(s) {
-  let out = '', last = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    let e = '';
-    if (c === 38) e = '&amp;';
-    else if (c === 60) e = '&lt;';
-    else if (c === 62) e = '&gt;';
-    else if (c === 34) e = '&quot;';
-    else if (c === 39) e = '&#39;';
-    else continue;
-    out += s.slice(last, i) + e;
+  let out = '', last = 0, m;
+  ESC_RE.lastIndex = 0;
+  while ((m = ESC_RE.exec(s)) !== null) {
+    const i = m.index, c = s.charCodeAt(i);
+    out += s.slice(last, i) + (c === 38 ? '&amp;' : c === 60 ? '&lt;' : c === 62 ? '&gt;' : c === 34 ? '&quot;' : '&#39;');
     last = i + 1;
   }
   return last === 0 ? s : out + s.slice(last);
@@ -28,21 +28,18 @@ export function escStr(s) {
 
 /** Push HTML-escaped s[a..b) onto `out` (chunked, no per-char pushes). */
 function escInto(out, s, a, b) {
-  let last = a;
-  for (let i = a; i < b; i++) {
-    const c = s.charCodeAt(i);
-    let e = '';
-    if (c === 38) e = '&amp;';
-    else if (c === 60) e = '&lt;';
-    else if (c === 62) e = '&gt;';
-    else if (c === 34) e = '&quot;';
-    else if (c === 39) e = '&#39;';
-    else continue;
-    if (i > last) out.push(s.slice(last, i));
-    out.push(e);
+  if (b - a <= 0) return;
+  const sub = b - a === s.length ? s : s.slice(a, b);
+  let last = 0, m;
+  ESC_RE.lastIndex = 0;
+  while ((m = ESC_RE.exec(sub)) !== null) {
+    const i = m.index, c = sub.charCodeAt(i);
+    if (i > last) out.push(sub.slice(last, i));
+    out.push(c === 38 ? '&amp;' : c === 60 ? '&lt;' : c === 62 ? '&gt;' : c === 34 ? '&quot;' : '&#39;');
     last = i + 1;
   }
-  if (b > last) out.push(s.slice(last, b));
+  if (last === 0) out.push(sub);
+  else if (last < sub.length) out.push(sub.slice(last));
 }
 
 /** The slug of `text`, exactly as the reference (NFKD, drop combining marks,
@@ -245,22 +242,23 @@ function parseFrontMatter(text) {
   let closeStart = -1;
   let closeEnd = -1;
   let lineNo = 2;
+  const starts = [];
+  const ends = [];
   while (pos <= text.length) {
     const nl = text.indexOf('\n', pos);
     const end = nl === -1 ? text.length : nl;
     if (text.slice(pos, end) === '---') { closeLine = lineNo; closeStart = pos; closeEnd = end; break; }
+    starts.push(pos);
+    ends.push(end);
     if (nl === -1) break;
     pos = nl + 1;
     lineNo++;
   }
   if (closeLine === -1) return { error: 'the front matter is not closed' };
   const data = {};
-  pos = p0 === -1 ? text.length : p0 + 1;
-  lineNo = 2;
-  while (pos < closeStart) {
-    const nl = text.indexOf('\n', pos);
-    const end = nl === -1 ? closeStart : Math.min(nl, closeStart);
-    const line = text.slice(pos, end);
+  for (let k = 0; k < starts.length; k++) {
+    const line = text.slice(starts[k], ends[k]);
+    const lineNo = k + 2;
     let blank = true;
     for (let i = 0; i < line.length; i++) {
       const c = line.charCodeAt(i);
@@ -293,9 +291,6 @@ function parseFrontMatter(text) {
       if ('error' in v) return v;
       data[key] = v.value;
     }
-    if (nl === -1 || nl >= closeStart) break;
-    pos = nl + 1;
-    lineNo++;
   }
   if (!hasOwn(data, 'title')) return { error: 'no title' };
   const body = closeEnd === text.length ? '' : text.slice(closeEnd + 1);
@@ -303,9 +298,14 @@ function parseFrontMatter(text) {
 }
 
 // ---------------------------------------------------------------- Markdown
-const ESCAPABLE_CC = new Set([92, 96, 42, 95, 91, 93, 40, 41, 35, 43, 45, 46, 33, 62]);
+const ESCAPABLE = new Uint8Array(128);
+for (const cc of [92, 96, 42, 95, 91, 93, 40, 41, 35, 43, 45, 46, 33, 62]) ESCAPABLE[cc] = 1;
+const INLINE_RE = /[\\`*\[&<>"']/g;
 
 function trimLine(line) {
+  if (line.length === 0) return line;
+  const c0 = line.charCodeAt(0), c1 = line.charCodeAt(line.length - 1);
+  if (c0 !== 32 && c0 !== 9 && c1 !== 32 && c1 !== 9) return line;
   let a = 0, b = line.length;
   while (a < b && (line.charCodeAt(a) === 32 || line.charCodeAt(a) === 9)) a++;
   while (b > a && (line.charCodeAt(b - 1) === 32 || line.charCodeAt(b - 1) === 9)) b--;
@@ -368,54 +368,77 @@ function isHR(line) {
 }
 
 function endsParagraph(line) {
-  return isBlank(line) || fenceLang(line) !== null || headingOf(line) !== null || isHR(line);
+  if (line.length === 0) return true;
+  const c0 = line.charCodeAt(0);
+  if (c0 === 32 || c0 === 9) return isBlank(line);
+  if (c0 === 96) return fenceLang(line) !== null;
+  if (c0 === 35) return headingOf(line) !== null;
+  if (c0 === 45 || c0 === 42) return isHR(line);
+  return false;
+}
+
+/** Whether the char at `j` is escaped by an odd run of backslashes in [from, j). */
+function isEscaped(s, from, j) {
+  let n = 0;
+  for (let k = j - 1; k >= from && s.charCodeAt(k) === 92; k--) n++;
+  return (n & 1) === 1;
 }
 
 /** First unescaped `what` at/after `from` and before `end`, or -1. */
 function findUnescaped(s, what, from, end) {
-  const wlen = what.length;
-  for (let j = from; j + wlen <= end; j++) {
-    if (s.charCodeAt(j) === 92 && j + 1 < end && ESCAPABLE_CC.has(s.charCodeAt(j + 1))) {
-      j++;
-      continue;
-    }
-    if (s.startsWith(what, j)) return j;
+  let j = s.indexOf(what, from);
+  while (j !== -1 && j + what.length <= end) {
+    if (!isEscaped(s, from, j)) return j;
+    j = s.indexOf(what, j + 1);
   }
   return -1;
 }
 
 /** First single `*` at/after `from` and before `end`, or -1. */
 function findSingleStar(s, from, end) {
-  for (let j = from; j < end; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < end && ESCAPABLE_CC.has(s.charCodeAt(j + 1))) {
-      j++;
-      continue;
-    }
-    if (c !== 42) continue;
-    if (s.charCodeAt(j + 1) === 42) { j++; continue; }
+  let j = s.indexOf('*', from);
+  while (j !== -1 && j < end) {
+    if (isEscaped(s, from, j)) { j = s.indexOf('*', j + 1); continue; }
+    if (s.charCodeAt(j + 1) === 42) { j = s.indexOf('*', j + 2); continue; }
     return j;
   }
   return -1;
 }
 
+const CONSTRUCT_RE = /[\\`*[]/;
+
+/** Inline-render a whole string (fast path when it holds no constructs). */
+function inlineStr(s, env) {
+  if (!CONSTRUCT_RE.test(s)) return escStr(s);
+  const o = [];
+  inlineRange(s, 0, s.length, env, o);
+  return o.join('');
+}
+
 /** Inline-render s[a..b) into `out` (reference inline, index-range form). */
 function inlineRange(s, a, b, env, out) {
-  let i = a, run = a;
-  const flush = (to) => { if (to > run) out.push(s.slice(run, to)); };
-  while (i < b) {
+  let i = a, run = a, m;
+  for (;;) {
+    INLINE_RE.lastIndex = i;
+    m = INLINE_RE.exec(s);
+    if (m === null || m.index >= b) break;
+    i = m.index;
     const c = s.charCodeAt(i);
-    if (c === 92 && i + 1 < b && ESCAPABLE_CC.has(s.charCodeAt(i + 1))) {
-      flush(i);
-      out.push(s[i + 1]);
-      i += 2;
-      run = i;
+    if (c === 92) {
+      if (i + 1 < b && s.charCodeAt(i + 1) < 128 && ESCAPABLE[s.charCodeAt(i + 1)]) {
+        if (i > run) out.push(s.slice(run, i));
+        out.push(s[i + 1]);
+        i += 2;
+        run = i;
+      } else {
+        i++;
+      }
       continue;
     }
     if (c === 96) {
       const j = s.indexOf('`', i + 1);
       if (j !== -1 && j < b && j > i + 1) {
-        flush(i);
+        if (i > run) out.push(s.slice(run, i));
         out.push('<code>');
         escInto(out, s, i + 1, j);
         out.push('</code>');
@@ -430,7 +453,7 @@ function inlineRange(s, a, b, env, out) {
       if (s.charCodeAt(i + 1) === 42) {
         const j = findUnescaped(s, '**', i + 2, b);
         if (j > i + 2) {
-          flush(i);
+          if (i > run) out.push(s.slice(run, i));
           out.push('<strong>');
           inlineRange(s, i + 2, j, env, out);
           out.push('</strong>');
@@ -443,7 +466,7 @@ function inlineRange(s, a, b, env, out) {
       }
       const j = findSingleStar(s, i + 1, b);
       if (j > i + 1) {
-        flush(i);
+        if (i > run) out.push(s.slice(run, i));
         out.push('<em>');
         inlineRange(s, i + 1, j, env, out);
         out.push('</em>');
@@ -458,15 +481,15 @@ function inlineRange(s, a, b, env, out) {
       const k = findUnescaped(s, ']', i + 1, b);
       let done = false;
       if (k !== -1 && k + 1 < b && s.charCodeAt(k + 1) === 40) {
-        const m = s.indexOf(')', k + 2);
-        if (m !== -1 && m < b) {
-          const target = s.slice(k + 2, m);
+        const mm = s.indexOf(')', k + 2);
+        if (mm !== -1 && mm < b) {
+          const target = s.slice(k + 2, mm);
           if (target !== '' && !/\s/.test(target)) {
-            flush(i);
+            if (i > run) out.push(s.slice(run, i));
             out.push('<a href="', escStr(env.link(target)), '">');
             inlineRange(s, i + 1, k, env, out);
             out.push('</a>');
-            i = m + 1;
+            i = mm + 1;
             run = i;
             done = true;
           }
@@ -475,16 +498,12 @@ function inlineRange(s, a, b, env, out) {
       if (!done) i++;
       continue;
     }
-    if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39) {
-      flush(i);
-      out.push(c === 38 ? '&amp;' : c === 60 ? '&lt;' : c === 62 ? '&gt;' : c === 34 ? '&quot;' : '&#39;');
-      i++;
-      run = i;
-      continue;
-    }
+    if (i > run) out.push(s.slice(run, i));
+    out.push(c === 38 ? '&amp;' : c === 60 ? '&lt;' : c === 62 ? '&gt;' : c === 34 ? '&quot;' : '&#39;');
     i++;
+    run = i;
   }
-  flush(b);
+  if (b > run) out.push(s.slice(run, b));
 }
 
 /** Render Markdown: { html, toc, excerpt } (reference renderMarkdown). */
@@ -495,7 +514,9 @@ function renderMarkdown(src, env, slugMemo) {
   let excerpt = null;
   const n = src.length;
   let pos = 0;
+  let peeked = undefined; // cached peekLine() result, or undefined
   const nextLine = () => {
+    if (peeked !== undefined) { const l = peeked; peeked = undefined; return l; }
     if (pos > n) return null;
     if (pos === n) { pos = n + 1; return ''; }
     const nl = src.indexOf('\n', pos);
@@ -509,16 +530,26 @@ function renderMarkdown(src, env, slugMemo) {
     return line;
   };
   const peekLine = () => {
+    if (peeked !== undefined) return peeked;
     if (pos > n) return null;
     if (pos === n) return '';
     const nl = src.indexOf('\n', pos);
-    return nl === -1 ? src.slice(pos) : src.slice(pos, nl);
+    if (nl === -1) {
+      peeked = src.slice(pos);
+      pos = n + 1;
+    } else {
+      peeked = src.slice(pos, nl);
+      pos = nl + 1;
+    }
+    return peeked;
   };
   while (true) {
     const line = nextLine();
     if (line === null) break;
-    if (isBlank(line)) continue;
-    const lang = fenceLang(line);
+    if (line.length === 0) continue;
+    const c0 = line.charCodeAt(0);
+    if ((c0 === 32 || c0 === 9) && isBlank(line)) continue;
+    const lang = c0 === 96 ? fenceLang(line) : null;
     if (lang !== null) {
       const body = [];
       while (true) {
@@ -527,23 +558,21 @@ function renderMarkdown(src, env, slugMemo) {
         body.push(l);
       }
       const cls = lang === '' ? '' : ' class="language-' + escStr(lang) + '"';
-      let code = '';
-      for (const l of body) code += escStr(l) + '\n';
-      blocks.push('<pre><code' + cls + '>' + code + '</code></pre>');
+      const codeParts = [];
+      for (const l of body) { codeParts.push(escStr(l), '\n'); }
+      blocks.push('<pre><code' + cls + '>' + codeParts.join('') + '</code></pre>');
       continue;
     }
-    const hd = headingOf(line);
+    const hd = c0 === 35 ? headingOf(line) : null;
     if (hd !== null) {
       const id = uniqueSlug(slugify(hd.text, slugMemo), ids);
-      const o = [];
-      inlineRange(hd.text, 0, hd.text.length, env, o);
-      const html = o.join('');
+      const html = inlineStr(hd.text, env);
       blocks.push('<h' + hd.depth + ' id="' + id + '">' + html + '</h' + hd.depth + '>');
       if (hd.depth === 2 || hd.depth === 3) toc.push({ level: hd.depth, id, html });
       continue;
     }
-    if (isHR(line)) { blocks.push('<hr>'); continue; }
-    if (line.charCodeAt(0) === 62) {
+    if ((c0 === 45 || c0 === 42) && isHR(line)) { blocks.push('<hr>'); continue; }
+    if (c0 === 62) {
       const body = [];
       let cur = line;
       while (true) {
@@ -560,19 +589,17 @@ function renderMarkdown(src, env, slugMemo) {
       if (lines.length === 0) {
         blocks.push('<blockquote>\n</blockquote>');
       } else {
-        const joined = lines.join('\n');
-        const o = [];
-        inlineRange(joined, 0, joined.length, env, o);
-        blocks.push('<blockquote>\n<p>' + o.join('') + '</p>\n</blockquote>');
+        const joined = lines.length === 1 ? lines[0] : lines.join('\n');
+        blocks.push('<blockquote>\n<p>' + inlineStr(joined, env) + '</p>\n</blockquote>');
       }
       continue;
     }
     let m = null, ordered = false, start = 1;
-    if (line.charCodeAt(0) === 45 && line.charCodeAt(1) === 32) {
+    if (c0 === 45 && line.charCodeAt(1) === 32) {
       m = line.slice(2); ordered = false;
-    } else if (line.charCodeAt(0) === 42 && line.charCodeAt(1) === 32) {
+    } else if (c0 === 42 && line.charCodeAt(1) === 32) {
       m = line.slice(2); ordered = false;
-    } else {
+    } else if (c0 >= 48 && c0 <= 57) {
       let d = 0;
       while (d < line.length && d < 9) {
         const c = line.charCodeAt(d);
@@ -618,10 +645,8 @@ function renderMarkdown(src, env, slugMemo) {
       const open = ordered && start !== 1 ? '<ol start="' + start + '">' : '<' + tag + '>';
       let html = open + '\n';
       for (const parts of items) {
-        const joined = parts.join('\n');
-        const o = [];
-        inlineRange(joined, 0, joined.length, env, o);
-        html += '<li>' + o.join('') + '</li>\n';
+        const joined = parts.length === 1 ? parts[0] : parts.join('\n');
+        html += '<li>' + inlineStr(joined, env) + '</li>\n';
       }
       blocks.push(html + '</' + tag + '>');
       continue;
@@ -632,14 +657,12 @@ function renderMarkdown(src, env, slugMemo) {
       if (nx === null || endsParagraph(nx)) break;
       body.push(trimLine(nextLine()));
     }
-    const text = body.join('\n');
-    const o = [];
-    inlineRange(text, 0, text.length, env, o);
-    const html = o.join('');
+    const text = body.length === 1 ? body[0] : body.join('\n');
+    const html = inlineStr(text, env);
     if (excerpt === null) excerpt = html;
     blocks.push('<p>' + html + '</p>');
   }
-  return { html: blocks.map((b) => b + '\n').join(''), toc, excerpt: excerpt === null ? '' : excerpt };
+  return { html: blocks.length === 0 ? '' : blocks.join('\n') + '\n', toc, excerpt: excerpt === null ? '' : excerpt };
 }
 
 // ---------------------------------------------------------------- Templates
@@ -758,11 +781,11 @@ function compileTemplate(nodes) {
   const gen = (list, bound, code) => {
     for (const n of list) {
       if (n.kind === 'text') {
-        code.push('out.push(' + JSON.stringify(n.text) + ');');
+        code.push('s+=' + JSON.stringify(n.text) + ';');
       } else if (n.kind === 'var') {
-        code.push('out.push(esc(txt(' + pathExpr(n.path, bound) + ')));');
+        code.push('s+=esc(txt(' + pathExpr(n.path, bound) + '));');
       } else if (n.kind === 'raw') {
-        code.push('out.push(txt(' + pathExpr(n.path, bound) + '));');
+        code.push('s+=txt(' + pathExpr(n.path, bound) + ');');
       } else if (n.kind === 'if') {
         code.push('if(tru(' + pathExpr(n.path, bound) + ')!==' + n.not + '){');
         gen(n.then, bound, code);
@@ -788,14 +811,15 @@ function compileTemplate(nodes) {
         code.push('if(' + hx + ')L.' + n.name + '=' + ox + ';else delete L.' + n.name + ';');
         code.push('if(' + hl + ')L.loop=' + ol + ';else delete L.loop;}}');
       } else if (n.kind === 'include') {
-        code.push('if(depth<8){const __f=T[' + JSON.stringify(n.name) + '];if(__f)__f(V,L,out,depth+1,T,esc,txt,tru,pr,has);}');
+        code.push('if(depth<8){const __f=T[' + JSON.stringify(n.name) + '];if(__f)s+=__f(V,L,depth+1,T,esc,txt,tru,pr,has);}');
       }
     }
   };
-  const code = [];
+  const code = ['let s="";'];
   gen(nodes, [], code);
+  code.push('return s;');
   const src = code.join('');
-  return new Function('V', 'L', 'out', 'depth', 'T', 'esc', 'txt', 'tru', 'pr', 'has', src);
+  return new Function('V', 'L', 'depth', 'T', 'esc', 'txt', 'tru', 'pr', 'has', src);
 }
 
 /** Fallback interpreter over the node tree (used only if codegen throws). */
@@ -832,11 +856,21 @@ function renderNodesFb(nodes, V, L, out, depth, T) {
     } else if (n.kind === 'include') {
       const t = T[n.name];
       if (t !== undefined && depth < INCLUDE_DEPTH) {
-        if (typeof t === 'function') t(V, L, out, depth + 1, T, escStr, textOf, truthy, pr, hasOwn);
+        if (typeof t === 'function') out.push(t(V, L, depth + 1, T, escStr, textOf, truthy, pr, hasOwn));
         else renderNodesFb(t.nodes, V, L, out, depth + 1, T);
       }
     }
   }
+}
+
+/** Count words (runs of non-whitespace) exactly as (s.match(/\S+/g)||[]).length. */
+const WS_SLASH_S = /\s\S/g;
+function wordCount(s) {
+  if (s.length === 0) return 0;
+  const m = s.match(WS_SLASH_S);
+  let n = m === null ? 0 : m.length;
+  if (!/\s/.test(s[0])) n++;
+  return n;
 }
 
 // ---------------------------------------------------------------- Pipeline
@@ -844,6 +878,10 @@ const REPORT_FILE = 'build-report.txt';
 const RESERVED = ['posts', 'tags', 'page'];
 
 function resolvePath(dir, rel) {
+  if (rel !== '.' && !rel.endsWith('/.') && rel.indexOf('..') === -1 && rel.indexOf('./') === -1
+    && rel.indexOf('//') === -1 && rel.charCodeAt(rel.length - 1) !== 47) {
+    return dir === '' ? rel : dir + '/' + rel;
+  }
   const parts = dir === '' ? [] : dir.split('/');
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
@@ -880,10 +918,10 @@ export function run(input) {
   const render = (name, V) => {
     const t = templates[name];
     if (t === undefined) return null;
-    const out = [];
     const L = Object.create(null);
-    if (typeof t === 'function') t(V, L, out, 0, templates, escStr, textOf, truthy, pr, hasOwn);
-    else renderNodesFb(t.nodes, V, L, out, 0, templates);
+    if (typeof t === 'function') return t(V, L, 0, templates, escStr, textOf, truthy, pr, hasOwn);
+    const out = [];
+    renderNodesFb(t.nodes, V, L, out, 0, templates);
     return out.join('');
   };
 
@@ -892,7 +930,7 @@ export function run(input) {
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.indexOf('\r') === -1 ? f.content : f.content.replace(/\r\n?/g, '\n') });
     else statics.push({ path: f.path, content: f.content });
   }
 
@@ -974,8 +1012,11 @@ export function run(input) {
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
         const path = rel === '' ? null : resolvePath(dir, rel);
-        if (path !== null && bySource.has(path)) return bySource.get(path).url + frag;
-        if (path !== null && staticPaths.has(path)) return base + '/' + path + frag;
+        if (path !== null) {
+          const tgt = bySource.get(path);
+          if (tgt !== undefined) return tgt.url + frag;
+          if (staticPaths.has(path)) return base + '/' + path + frag;
+        }
         broken.add('broken-link ' + s.path + ' -> ' + target);
         return target;
       },
@@ -1040,7 +1081,7 @@ export function run(input) {
       date_long: s.data.date === undefined ? '' : longDate(s.data.date),
       summary: s.data.summary !== undefined ? s.data.summary : '',
       excerpt: s.excerpt,
-      reading_minutes: Math.max(1, Math.ceil((s.body.match(/\S+/g) || []).length / 200)),
+      reading_minutes: Math.max(1, Math.ceil((wordCount(s.body)) / 200)),
       tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
     };
     cardCache.set(s, c);
@@ -1053,7 +1094,7 @@ export function run(input) {
       title: c.title, url: c.url, date: c.date, date_long: c.date_long,
       summary: c.summary, excerpt: c.excerpt, reading_minutes: c.reading_minutes, tags: c.tags,
       slug: s.slug, content: s.html,
-      toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+      toc: s.toc,
       newer: linkOf(s.newer !== undefined && s.newer !== null ? s.newer : null),
       older: linkOf(s.older !== undefined && s.older !== null ? s.older : null),
       is_post: s.post,
