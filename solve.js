@@ -1,11 +1,14 @@
-// site-generator-speed-01 entry B v2: fast reimplementation of makefun-site 1.0.0.
+// site-generator-speed-01 entry B v3: fast reimplementation of makefun-site 1.0.0.
 // Dependency-free ES module. Strategies: template codegen via `new Function`
 // (string-concat accumulator; flat op-list interpreter fallback if codegen
 // ever throws), single-pass Markdown over index ranges, hand-scanned front
-// matter, memoised slugify. v2 optimisations over v1: regex-jump escape and
-// inline scanners, indexOf-based emphasis/link search, word-count via
-// /\s\S/ transitions, first-char dispatch in the Markdown block loop,
-// peek-line cache, single-scan front matter, `toc: s.toc` (identical shape).
+// matter, memoised slugify. v3 optimisations over v2: inline rendering via a
+// single-scan string-concat scanner (inlineCat), range-based (slice-free)
+// line handling in renderMarkdown with the word count fused into line
+// extraction, an indexOf fast path in escStr for short strings, and
+// include-output caching (constant templates cached per depth; templates
+// reading one loop var cached per that var's value) driven by a conservative
+// static dependency analysis (analyzeDeps/includePlan).
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
   'August', 'September', 'October', 'November', 'December'];
@@ -14,8 +17,9 @@ const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 const ESC_RE = /[&<>"']/g;
 
-/** HTML-escape `s` to a new string. */
+/** HTML-escape `s` to a new string. Short strings take an indexOf fast path. */
 export function escStr(s) {
+  if (s.length < 64 && s.indexOf('&') === -1 && s.indexOf('<') === -1 && s.indexOf('>') === -1 && s.indexOf('"') === -1 && s.indexOf("'") === -1) return s;
   let out = '', last = 0, m;
   ESC_RE.lastIndex = 0;
   while ((m = ESC_RE.exec(s)) !== null) {
@@ -302,19 +306,18 @@ const ESCAPABLE = new Uint8Array(128);
 for (const cc of [92, 96, 42, 95, 91, 93, 40, 41, 35, 43, 45, 46, 33, 62]) ESCAPABLE[cc] = 1;
 const INLINE_RE = /[\\`*\[&<>"']/g;
 
-function trimLine(line) {
-  if (line.length === 0) return line;
-  const c0 = line.charCodeAt(0), c1 = line.charCodeAt(line.length - 1);
-  if (c0 !== 32 && c0 !== 9 && c1 !== 32 && c1 !== 9) return line;
-  let a = 0, b = line.length;
-  while (a < b && (line.charCodeAt(a) === 32 || line.charCodeAt(a) === 9)) a++;
-  while (b > a && (line.charCodeAt(b - 1) === 32 || line.charCodeAt(b - 1) === 9)) b--;
-  return line.slice(a, b);
+// Trimmed range of s[a..b) is left in _ta/_tb (space/tab edges only).
+let _ta = 0, _tb = 0;
+function trimR(s, a, b) {
+  let x = a, y = b;
+  while (x < y && (s.charCodeAt(x) === 32 || s.charCodeAt(x) === 9)) x++;
+  while (y > x && (s.charCodeAt(y - 1) === 32 || s.charCodeAt(y - 1) === 9)) y--;
+  _ta = x; _tb = y;
 }
 
-function isBlank(line) {
-  for (let i = 0; i < line.length; i++) {
-    const c = line.charCodeAt(i);
+function isBlankR(s, a, b) {
+  for (let i = a; i < b; i++) {
+    const c = s.charCodeAt(i);
     if (c !== 32 && c !== 9) return false;
   }
   return true;
@@ -325,55 +328,56 @@ function isLangChar(c) {
     || c === 95 || c === 43 || c === 45;
 }
 
-/** Fence-open language of `line`, or null (reference FENCE_OPEN). */
-function fenceLang(line) {
-  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return null;
-  let i = 3;
-  while (i < line.length && isLangChar(line.charCodeAt(i))) i++;
+/** Fence-open language of s[a..b), or null (reference FENCE_OPEN). */
+function fenceLang(s, a, b) {
+  if (b - a < 3 || s.charCodeAt(a) !== 96 || s.charCodeAt(a + 1) !== 96 || s.charCodeAt(a + 2) !== 96) return null;
+  let i = a + 3;
+  while (i < b && isLangChar(s.charCodeAt(i))) i++;
   const langEnd = i;
-  while (i < line.length && (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9)) i++;
-  return i === line.length ? line.slice(3, langEnd) : null;
+  while (i < b && (s.charCodeAt(i) === 32 || s.charCodeAt(i) === 9)) i++;
+  return i === b ? s.slice(a + 3, langEnd) : null;
 }
 
-function fenceClose(line) {
-  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
-  for (let i = 3; i < line.length; i++) {
-    const c = line.charCodeAt(i);
+function fenceClose(s, a, b) {
+  if (b - a < 3 || s.charCodeAt(a) !== 96 || s.charCodeAt(a + 1) !== 96 || s.charCodeAt(a + 2) !== 96) return false;
+  for (let i = a + 3; i < b; i++) {
+    const c = s.charCodeAt(i);
     if (c !== 32 && c !== 9) return false;
   }
   return true;
 }
 
-/** { depth, text } of a heading line, or null (reference headingOf). */
-function headingOf(line) {
+/** { depth, ta, tb } of a heading line, or null (reference headingOf). */
+function headingOf(s, a, b) {
   let n = 0;
-  while (n < line.length && line.charCodeAt(n) === 35) n++;
+  while (a + n < b && s.charCodeAt(a + n) === 35) n++;
   if (n === 0 || n > 6) return null;
-  if (n >= line.length) return null;
-  const c = line.charCodeAt(n);
+  if (a + n >= b) return null;
+  const c = s.charCodeAt(a + n);
   if (c !== 32 && c !== 9) return null;
-  const text = trimLine(line.slice(n + 1));
-  return text === '' ? null : { depth: n, text };
+  trimR(s, a + n + 1, b);
+  if (_ta === _tb) return null;
+  return { depth: n, ta: _ta, tb: _tb };
 }
 
-function isHR(line) {
-  const t = line === '---' || line === '***';
-  if (t) return true;
-  if (!line.startsWith('---') && !line.startsWith('***')) return false;
-  for (let i = 3; i < line.length; i++) {
-    const c = line.charCodeAt(i);
+function isHR(s, a, b) {
+  if (b - a < 3) return false;
+  const c0 = s.charCodeAt(a), c1 = s.charCodeAt(a + 1), c2 = s.charCodeAt(a + 2);
+  if (!((c0 === 45 && c1 === 45 && c2 === 45) || (c0 === 42 && c1 === 42 && c2 === 42))) return false;
+  for (let i = a + 3; i < b; i++) {
+    const c = s.charCodeAt(i);
     if (c !== 32 && c !== 9) return false;
   }
   return true;
 }
 
-function endsParagraph(line) {
-  if (line.length === 0) return true;
-  const c0 = line.charCodeAt(0);
-  if (c0 === 32 || c0 === 9) return isBlank(line);
-  if (c0 === 96) return fenceLang(line) !== null;
-  if (c0 === 35) return headingOf(line) !== null;
-  if (c0 === 45 || c0 === 42) return isHR(line);
+function endsParagraph(s, a, b) {
+  if (a === b) return true;
+  const c0 = s.charCodeAt(a);
+  if (c0 === 32 || c0 === 9) return isBlankR(s, a, b);
+  if (c0 === 96) return fenceLang(s, a, b) !== null;
+  if (c0 === 35) return headingOf(s, a, b) !== null;
+  if (c0 === 45 || c0 === 42) return isHR(s, a, b);
   return false;
 }
 
@@ -405,19 +409,27 @@ function findSingleStar(s, from, end) {
   return -1;
 }
 
-const CONSTRUCT_RE = /[\\`*[]/;
-
-/** Inline-render a whole string (fast path when it holds no constructs). */
+/** Inline-render a whole string. */
 function inlineStr(s, env) {
-  if (!CONSTRUCT_RE.test(s)) return escStr(s);
-  const o = [];
-  inlineRange(s, 0, s.length, env, o);
-  return o.join('');
+  return inlineCat(s, 0, s.length, env);
 }
 
-/** Inline-render s[a..b) into `out` (reference inline, index-range form). */
-function inlineRange(s, a, b, env, out) {
-  let i = a, run = a, m;
+/** Inline-render s[a..b). */
+function inlineStrR(s, a, b, env) {
+  return inlineCat(s, a, b, env);
+}
+
+/** Whether char code c is \s (exact for a single char). */
+function isWsCode(c) {
+  return c === 32 || (c >= 9 && c <= 13) || c === 0xa0 || c === 0x1680
+    || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029
+    || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
+}
+
+/** Inline-render s[a..b) to a string (reference inline, index-range form).
+ *  Single regex-jump scan; string-concat accumulator (V8 ropes). */
+function inlineCat(s, a, b, env) {
+  let out = '', i = a, run = a, m;
   for (;;) {
     INLINE_RE.lastIndex = i;
     m = INLINE_RE.exec(s);
@@ -426,8 +438,8 @@ function inlineRange(s, a, b, env, out) {
     const c = s.charCodeAt(i);
     if (c === 92) {
       if (i + 1 < b && s.charCodeAt(i + 1) < 128 && ESCAPABLE[s.charCodeAt(i + 1)]) {
-        if (i > run) out.push(s.slice(run, i));
-        out.push(s[i + 1]);
+        if (i > run) out += s.slice(run, i);
+        out += s[i + 1];
         i += 2;
         run = i;
       } else {
@@ -438,10 +450,8 @@ function inlineRange(s, a, b, env, out) {
     if (c === 96) {
       const j = s.indexOf('`', i + 1);
       if (j !== -1 && j < b && j > i + 1) {
-        if (i > run) out.push(s.slice(run, i));
-        out.push('<code>');
-        escInto(out, s, i + 1, j);
-        out.push('</code>');
+        if (i > run) out += s.slice(run, i);
+        out += '<code>' + escStr(s.slice(i + 1, j)) + '</code>';
         i = j + 1;
         run = i;
       } else {
@@ -453,10 +463,8 @@ function inlineRange(s, a, b, env, out) {
       if (s.charCodeAt(i + 1) === 42) {
         const j = findUnescaped(s, '**', i + 2, b);
         if (j > i + 2) {
-          if (i > run) out.push(s.slice(run, i));
-          out.push('<strong>');
-          inlineRange(s, i + 2, j, env, out);
-          out.push('</strong>');
+          if (i > run) out += s.slice(run, i);
+          out += '<strong>' + inlineCat(s, i + 2, j, env) + '</strong>';
           i = j + 2;
           run = i;
         } else {
@@ -466,10 +474,8 @@ function inlineRange(s, a, b, env, out) {
       }
       const j = findSingleStar(s, i + 1, b);
       if (j > i + 1) {
-        if (i > run) out.push(s.slice(run, i));
-        out.push('<em>');
-        inlineRange(s, i + 1, j, env, out);
-        out.push('</em>');
+        if (i > run) out += s.slice(run, i);
+        out += '<em>' + inlineCat(s, i + 1, j, env) + '</em>';
         i = j + 1;
         run = i;
       } else {
@@ -485,10 +491,8 @@ function inlineRange(s, a, b, env, out) {
         if (mm !== -1 && mm < b) {
           const target = s.slice(k + 2, mm);
           if (target !== '' && !/\s/.test(target)) {
-            if (i > run) out.push(s.slice(run, i));
-            out.push('<a href="', escStr(env.link(target)), '">');
-            inlineRange(s, i + 1, k, env, out);
-            out.push('</a>');
+            if (i > run) out += s.slice(run, i);
+            out += '<a href="' + escStr(env.link(target)) + '">' + inlineCat(s, i + 1, k, env) + '</a>';
             i = mm + 1;
             run = i;
             done = true;
@@ -498,15 +502,18 @@ function inlineRange(s, a, b, env, out) {
       if (!done) i++;
       continue;
     }
-    if (i > run) out.push(s.slice(run, i));
-    out.push(c === 38 ? '&amp;' : c === 60 ? '&lt;' : c === 62 ? '&gt;' : c === 34 ? '&quot;' : '&#39;');
+    if (i > run) out += s.slice(run, i);
+    out += c === 38 ? '&amp;' : c === 60 ? '&lt;' : c === 62 ? '&gt;' : c === 34 ? '&quot;' : '&#39;';
     i++;
     run = i;
   }
-  if (b > run) out.push(s.slice(run, b));
+  if (b > run) out += s.slice(run, b);
+  return out;
 }
 
-/** Render Markdown: { html, toc, excerpt } (reference renderMarkdown). */
+/** Render Markdown: { html, toc, excerpt, words } (reference renderMarkdown).
+ *  Lines are index ranges [la, lb) of src — no per-line substrings.
+ *  Word count is fused into line extraction (one pass over the body). */
 function renderMarkdown(src, env, slugMemo) {
   const ids = new Set();
   const blocks = [];
@@ -514,128 +521,147 @@ function renderMarkdown(src, env, slugMemo) {
   let excerpt = null;
   const n = src.length;
   let pos = 0;
-  let peeked = undefined; // cached peekLine() result, or undefined
-  const nextLine = () => {
-    if (peeked !== undefined) { const l = peeked; peeked = undefined; return l; }
-    if (pos > n) return null;
-    if (pos === n) { pos = n + 1; return ''; }
-    const nl = src.indexOf('\n', pos);
-    if (nl === -1) {
-      const line = src.slice(pos);
-      pos = n + 1;
-      return line;
+  let pkA = -1, pkB = -1; // cached peekLine() range, or -1
+  let la = 0, lb = 0;     // current line range
+  let words = 0, prevWs = true;
+  // Count words (runs of non-whitespace) in s[a..b); the '\n' after the
+  // line is whitespace, so prevWs resets after every line. Exact for the
+  // full \s set: ASCII fast lanes, unicode spaces only for c >= 128.
+  const countRange = (a, b) => {
+    for (let i = a; i < b; i++) {
+      const c = src.charCodeAt(i);
+      if (c < 33) {
+        if (c === 32 || (c >= 9 && c <= 13)) prevWs = true;
+        else if (prevWs) { words++; prevWs = false; }
+      } else if (c < 128) {
+        if (prevWs) words++;
+        prevWs = false;
+      } else if (c === 0xa0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff) {
+        prevWs = true;
+      } else if (prevWs) { words++; prevWs = false; }
     }
-    const line = src.slice(pos, nl);
-    pos = nl + 1;
-    return line;
+    prevWs = true;
+  };
+  const nextLine = () => {
+    if (pkA !== -1) { la = pkA; lb = pkB; pkA = -1; return true; }
+    if (pos > n) return false;
+    if (pos === n) { la = n; lb = n; pos = n + 1; return true; }
+    const nl = src.indexOf('\n', pos);
+    if (nl === -1) { la = pos; lb = n; pos = n + 1; }
+    else { la = pos; lb = nl; pos = nl + 1; }
+    countRange(la, lb);
+    return true;
   };
   const peekLine = () => {
-    if (peeked !== undefined) return peeked;
-    if (pos > n) return null;
-    if (pos === n) return '';
+    if (pkA !== -1) { la = pkA; lb = pkB; return true; }
+    if (pos > n) return false;
+    if (pos === n) { la = n; lb = n; return true; }
     const nl = src.indexOf('\n', pos);
-    if (nl === -1) {
-      peeked = src.slice(pos);
-      pos = n + 1;
-    } else {
-      peeked = src.slice(pos, nl);
-      pos = nl + 1;
-    }
-    return peeked;
+    if (nl === -1) { pkA = pos; pkB = n; pos = n + 1; }
+    else { pkA = pos; pkB = nl; pos = nl + 1; }
+    la = pkA; lb = pkB;
+    countRange(pkA, pkB);
+    return true;
   };
   while (true) {
-    const line = nextLine();
-    if (line === null) break;
-    if (line.length === 0) continue;
-    const c0 = line.charCodeAt(0);
-    if ((c0 === 32 || c0 === 9) && isBlank(line)) continue;
-    const lang = c0 === 96 ? fenceLang(line) : null;
+    if (!nextLine()) break;
+    if (la === lb) continue;
+    const c0 = src.charCodeAt(la);
+    if ((c0 === 32 || c0 === 9) && isBlankR(src, la, lb)) continue;
+    const lang = c0 === 96 ? fenceLang(src, la, lb) : null;
     if (lang !== null) {
-      const body = [];
+      let fA = -1, fB = -1;
       while (true) {
-        const l = nextLine();
-        if (l === null || fenceClose(l)) break;
-        body.push(l);
+        if (!nextLine()) break;
+        if (fenceClose(src, la, lb)) break;
+        if (fA === -1) fA = la;
+        fB = lb;
       }
       const cls = lang === '' ? '' : ' class="language-' + escStr(lang) + '"';
       const codeParts = [];
-      for (const l of body) { codeParts.push(escStr(l), '\n'); }
+      if (fA !== -1) { escInto(codeParts, src, fA, fB); codeParts.push('\n'); }
       blocks.push('<pre><code' + cls + '>' + codeParts.join('') + '</code></pre>');
       continue;
     }
-    const hd = c0 === 35 ? headingOf(line) : null;
+    const hd = c0 === 35 ? headingOf(src, la, lb) : null;
     if (hd !== null) {
-      const id = uniqueSlug(slugify(hd.text, slugMemo), ids);
-      const html = inlineStr(hd.text, env);
+      const id = uniqueSlug(slugify(src.slice(hd.ta, hd.tb), slugMemo), ids);
+      const html = inlineStrR(src, hd.ta, hd.tb, env);
       blocks.push('<h' + hd.depth + ' id="' + id + '">' + html + '</h' + hd.depth + '>');
       if (hd.depth === 2 || hd.depth === 3) toc.push({ level: hd.depth, id, html });
       continue;
     }
-    if ((c0 === 45 || c0 === 42) && isHR(line)) { blocks.push('<hr>'); continue; }
+    if ((c0 === 45 || c0 === 42) && isHR(src, la, lb)) { blocks.push('<hr>'); continue; }
     if (c0 === 62) {
-      const body = [];
-      let cur = line;
+      const qa = [], qb = [];
+      let ca = la, cb = lb;
       while (true) {
-        body.push(cur.slice(1).replace(/^ ?/, ''));
-        const nx = peekLine();
-        if (nx === null || nx.charCodeAt(0) !== 62) break;
-        cur = nextLine();
+        let a = ca + 1;
+        if (a < cb && src.charCodeAt(a) === 32) a++;
+        trimR(src, a, cb);
+        if (_ta < _tb) { qa.push(_ta); qb.push(_tb); }
+        if (!peekLine()) break;
+        if (la >= lb || src.charCodeAt(la) !== 62) break;
+        nextLine();
+        ca = la; cb = lb;
       }
-      const lines = [];
-      for (const l of body) {
-        const t = trimLine(l);
-        if (t !== '') lines.push(t);
-      }
-      if (lines.length === 0) {
+      if (qa.length === 0) {
         blocks.push('<blockquote>\n</blockquote>');
+      } else if (qa.length === 1) {
+        blocks.push('<blockquote>\n<p>' + inlineStrR(src, qa[0], qb[0], env) + '</p>\n</blockquote>');
       } else {
-        const joined = lines.length === 1 ? lines[0] : lines.join('\n');
-        blocks.push('<blockquote>\n<p>' + inlineStr(joined, env) + '</p>\n</blockquote>');
+        const parts = [];
+        for (let k = 0; k < qa.length; k++) parts.push(src.slice(qa[k], qb[k]));
+        blocks.push('<blockquote>\n<p>' + inlineStr(parts.join('\n'), env) + '</p>\n</blockquote>');
       }
       continue;
     }
-    let m = null, ordered = false, start = 1;
-    if (c0 === 45 && line.charCodeAt(1) === 32) {
-      m = line.slice(2); ordered = false;
-    } else if (c0 === 42 && line.charCodeAt(1) === 32) {
-      m = line.slice(2); ordered = false;
+    let mA = -1, mB = -1, ordered = false, start = 1;
+    if (c0 === 45 && src.charCodeAt(la + 1) === 32) {
+      mA = la + 2; mB = lb;
+    } else if (c0 === 42 && src.charCodeAt(la + 1) === 32) {
+      mA = la + 2; mB = lb;
     } else if (c0 >= 48 && c0 <= 57) {
       let d = 0;
-      while (d < line.length && d < 9) {
-        const c = line.charCodeAt(d);
+      while (d < 9 && la + d < lb) {
+        const c = src.charCodeAt(la + d);
         if (c < 48 || c > 57) break;
         d++;
       }
-      if (d >= 1 && line.charCodeAt(d) === 46 && line.charCodeAt(d + 1) === 32) {
-        m = line.slice(d + 2); ordered = true; start = Number(line.slice(0, d));
+      if (d >= 1 && src.charCodeAt(la + d) === 46 && src.charCodeAt(la + d + 1) === 32) {
+        mA = la + d + 2; mB = lb; ordered = true; start = Number(src.slice(la, la + d));
       }
     }
-    if (m !== null) {
-      const items = [[trimLine(m)]];
+    if (mA !== -1) {
+      const ia = [], ib = [], starts = [0];
+      trimR(src, mA, mB);
+      ia.push(_ta); ib.push(_tb);
       while (true) {
-        const nx = peekLine();
-        if (nx === null) break;
-        let nm = null;
+        if (!peekLine()) break;
+        let nmA = -1, nmB = -1;
         if (!ordered) {
-          if ((nx.charCodeAt(0) === 45 || nx.charCodeAt(0) === 42) && nx.charCodeAt(1) === 32) nm = nx.slice(2);
+          if ((src.charCodeAt(la) === 45 || src.charCodeAt(la) === 42) && src.charCodeAt(la + 1) === 32) { nmA = la + 2; nmB = lb; }
         } else {
           let d = 0;
-          while (d < nx.length && d < 9) {
-            const c = nx.charCodeAt(d);
+          while (d < 9 && la + d < lb) {
+            const c = src.charCodeAt(la + d);
             if (c < 48 || c > 57) break;
             d++;
           }
-          if (d >= 1 && nx.charCodeAt(d) === 46 && nx.charCodeAt(d + 1) === 32) nm = nx.slice(d + 2);
+          if (d >= 1 && src.charCodeAt(la + d) === 46 && src.charCodeAt(la + d + 1) === 32) { nmA = la + d + 2; nmB = lb; }
         }
-        if (nm !== null) {
-          items.push([trimLine(nm)]);
+        if (nmA !== -1) {
+          starts.push(ia.length);
+          trimR(src, nmA, nmB);
+          ia.push(_ta); ib.push(_tb);
           nextLine();
           continue;
         }
         let sp = 0;
-        while (sp < nx.length && nx.charCodeAt(sp) === 32) sp++;
-        if (sp >= 2 && sp < nx.length && !/\s/.test(nx[sp])) {
-          items[items.length - 1].push(trimLine(nx));
+        while (la + sp < lb && src.charCodeAt(la + sp) === 32) sp++;
+        if (sp >= 2 && la + sp < lb && !isWsCode(src.charCodeAt(la + sp))) {
+          trimR(src, la, lb);
+          ia.push(_ta); ib.push(_tb);
           nextLine();
           continue;
         }
@@ -644,25 +670,42 @@ function renderMarkdown(src, env, slugMemo) {
       const tag = ordered ? 'ol' : 'ul';
       const open = ordered && start !== 1 ? '<ol start="' + start + '">' : '<' + tag + '>';
       let html = open + '\n';
-      for (const parts of items) {
-        const joined = parts.length === 1 ? parts[0] : parts.join('\n');
-        html += '<li>' + inlineStr(joined, env) + '</li>\n';
+      starts.push(ia.length);
+      for (let it = 0; it < starts.length - 1; it++) {
+        const s0 = starts[it], s1 = starts[it + 1];
+        if (s1 - s0 === 1) {
+          html += '<li>' + inlineStrR(src, ia[s0], ib[s0], env) + '</li>\n';
+        } else {
+          const parts = [];
+          for (let k = s0; k < s1; k++) parts.push(src.slice(ia[k], ib[k]));
+          html += '<li>' + inlineStr(parts.join('\n'), env) + '</li>\n';
+        }
       }
       blocks.push(html + '</' + tag + '>');
       continue;
     }
-    const body = [trimLine(line)];
+    const pa = [], pb = [];
+    trimR(src, la, lb);
+    pa.push(_ta); pb.push(_tb);
     while (true) {
-      const nx = peekLine();
-      if (nx === null || endsParagraph(nx)) break;
-      body.push(trimLine(nextLine()));
+      if (!peekLine()) break;
+      if (endsParagraph(src, la, lb)) break;
+      nextLine();
+      trimR(src, la, lb);
+      pa.push(_ta); pb.push(_tb);
     }
-    const text = body.length === 1 ? body[0] : body.join('\n');
-    const html = inlineStr(text, env);
+    let html;
+    if (pa.length === 1) {
+      html = inlineStrR(src, pa[0], pb[0], env);
+    } else {
+      const parts = [];
+      for (let k = 0; k < pa.length; k++) parts.push(src.slice(pa[k], pb[k]));
+      html = inlineStr(parts.join('\n'), env);
+    }
     if (excerpt === null) excerpt = html;
     blocks.push('<p>' + html + '</p>');
   }
-  return { html: blocks.length === 0 ? '' : blocks.join('\n') + '\n', toc, excerpt: excerpt === null ? '' : excerpt };
+  return { html: blocks.length === 0 ? '' : blocks.join('\n') + '\n', toc, excerpt: excerpt === null ? '' : excerpt, words };
 }
 
 // ---------------------------------------------------------------- Templates
@@ -762,8 +805,79 @@ function parseTemplate(name, src) {
   return root.body;
 }
 
+// Dependency analysis for include-output caching.
+// analyzeDeps(parsed, name, bound) walks template `name` (and its transitive
+// includes) and returns { free, caller } or null when unsafe (include cycle).
+// `bound` maps names bound at this point to 'caller' (bound by an enclosing
+// for in the template that includes this one) or 'local' (bound by a for
+// inside this template). A reference to a 'caller' name is a dependency on
+// the caller's value; a 'local' name is derived from a for collection that
+// is itself recorded as a dependency. `free` holds roots read while unbound.
+// Run-constants are site/tags/recent (same objects for the whole run), so a
+// template is cacheable only when free ⊆ {site,tags,recent} and its caller
+// reads are empty (constant) or a single non-'loop' var (keyed by its value).
+// 'loop' is never a key: the loop object is mutated per iteration.
+const RUN_CONSTANTS = new Set(['site', 'tags', 'recent']);
+function analyzeDeps(parsed, name, bound, seen) {
+  if (seen.has(name)) return null;
+  const nodes = parsed[name];
+  if (nodes === undefined) return { free: new Set(), caller: new Set() };
+  seen.add(name);
+  const free = new Set(), caller = new Set();
+  let ok = true;
+  const note = (path, bnd) => {
+    const f = path[0];
+    const src = bnd.get(f);
+    if (src === 'caller') caller.add(f);
+    else if (src === undefined) free.add(f);
+  };
+  const walk = (list, bnd) => {
+    for (const n of list) {
+      if (!ok) return;
+      if (n.kind === 'var' || n.kind === 'raw') {
+        note(n.path, bnd);
+      } else if (n.kind === 'if') {
+        note(n.path, bnd);
+        walk(n.then, bnd);
+        if (n.else !== null) walk(n.else, bnd);
+      } else if (n.kind === 'for') {
+        note(n.path, bnd);
+        const nb = new Map(bnd);
+        nb.set(n.name, 'local');
+        nb.set('loop', 'local');
+        walk(n.body, nb);
+      } else if (n.kind === 'include') {
+        const d = analyzeDeps(parsed, n.name, bnd, seen);
+        if (d === null) { ok = false; return; }
+        for (const x of d.free) free.add(x);
+        for (const x of d.caller) caller.add(x);
+      }
+    }
+  };
+  walk(nodes, bound);
+  seen.delete(name);
+  return ok ? { free, caller } : null;
+}
+
+/** Cache plan for an include of `name` with `boundArr` (gen's bound stack):
+ *  { kind: 'const' } | { kind: 'key', key: varName } | null (do not cache). */
+function includePlan(parsed, name, boundArr) {
+  const bound = new Map();
+  for (const b of boundArr) bound.set(b, 'caller');
+  if (boundArr.length > 0) bound.set('loop', 'caller');
+  const d = analyzeDeps(parsed, name, bound, new Set());
+  if (d === null) return null;
+  for (const f of d.free) if (!RUN_CONSTANTS.has(f)) return null;
+  if (d.caller.size === 0) return { kind: 'const' };
+  if (d.caller.size === 1) {
+    const v = [...d.caller][0];
+    if (v !== 'loop') return { kind: 'key', key: v };
+  }
+  return null;
+}
+
 /** Codegen: compile a node tree to a function (V, L, out, depth, T). */
-function compileTemplate(nodes) {
+function compileTemplate(nodes, parsed) {
   let uid = 0;
   // Emit a path expression. `bound` is the stack of for-var names enclosing
   // this point (innermost last); 'loop' is bound whenever the stack is non-empty.
@@ -811,7 +925,18 @@ function compileTemplate(nodes) {
         code.push('if(' + hx + ')L.' + n.name + '=' + ox + ';else delete L.' + n.name + ';');
         code.push('if(' + hl + ')L.loop=' + ol + ';else delete L.loop;}}');
       } else if (n.kind === 'include') {
-        code.push('if(depth<8){const __f=T[' + JSON.stringify(n.name) + '];if(__f)s+=__f(V,L,depth+1,T,esc,txt,tru,pr,has);}');
+        const plan = includePlan(parsed, n.name, bound);
+        const nm = JSON.stringify(n.name);
+        if (plan === null) {
+          code.push('if(depth<8){const __f=T[' + nm + '];if(__f)s+=__f(V,L,depth+1,T,esc,txt,tru,pr,has,C);}');
+        } else if (plan.kind === 'const') {
+          // Output depends only on run-constants: cache per (template, depth).
+          code.push('if(depth<8){const __f=T[' + nm + '];if(__f){let __m=C[' + nm + '];if(!__m)__m=C[' + nm + ']=new Map();let __s=__m.get(depth);if(__s===undefined){__s=__f(V,L,depth+1,T,esc,txt,tru,pr,has,C);__m.set(depth,__s);}s+=__s;}}');
+        } else {
+          // Output depends only on run-constants + one loop var: cache per (var value, depth).
+          const kv = JSON.stringify(plan.key);
+          code.push('if(depth<8){const __f=T[' + nm + '];if(__f){let __m=C[' + nm + '];if(!__m)__m=C[' + nm + ']=new Map();const __k=L[' + kv + '];let __d=__m.get(__k);let __s;if(__d===undefined){__s=__f(V,L,depth+1,T,esc,txt,tru,pr,has,C);__m.set(__k,new Map([[depth,__s]]));}else{__s=__d.get(depth);if(__s===undefined){__s=__f(V,L,depth+1,T,esc,txt,tru,pr,has,C);__d.set(depth,__s);}}s+=__s;}}');
+        }
       }
     }
   };
@@ -819,7 +944,7 @@ function compileTemplate(nodes) {
   gen(nodes, [], code);
   code.push('return s;');
   const src = code.join('');
-  return new Function('V', 'L', 'depth', 'T', 'esc', 'txt', 'tru', 'pr', 'has', src);
+  return new Function('V', 'L', 'depth', 'T', 'esc', 'txt', 'tru', 'pr', 'has', 'C', src);
 }
 
 /** Fallback interpreter over the node tree (used only if codegen throws). */
@@ -831,14 +956,14 @@ function lookupPath(L, V, path) {
   return v;
 }
 
-function renderNodesFb(nodes, V, L, out, depth, T) {
+function renderNodesFb(nodes, V, L, out, depth, T, C) {
   for (const n of nodes) {
     if (n.kind === 'text') out.push(n.text);
     else if (n.kind === 'var') out.push(escStr(textOf(lookupPath(L, V, n.path))));
     else if (n.kind === 'raw') out.push(textOf(lookupPath(L, V, n.path)));
     else if (n.kind === 'if') {
       const branch = truthy(lookupPath(L, V, n.path)) !== n.not ? n.then : n.else;
-      if (branch !== null) renderNodesFb(branch, V, L, out, depth, T);
+      if (branch !== null) renderNodesFb(branch, V, L, out, depth, T, C);
     } else if (n.kind === 'for') {
       const xs = lookupPath(L, V, n.path);
       if (!Array.isArray(xs)) continue;
@@ -849,28 +974,18 @@ function renderNodesFb(nodes, V, L, out, depth, T) {
         L[n.name] = xs[k];
         L.loop = lp;
         lp.index = k + 1; lp.first = k === 0; lp.last = k === xs.length - 1;
-        renderNodesFb(n.body, V, L, out, depth, T);
+        renderNodesFb(n.body, V, L, out, depth, T, C);
       }
       if (hx) L[n.name] = ox; else delete L[n.name];
       if (hl) L.loop = ol; else delete L.loop;
     } else if (n.kind === 'include') {
       const t = T[n.name];
       if (t !== undefined && depth < INCLUDE_DEPTH) {
-        if (typeof t === 'function') out.push(t(V, L, depth + 1, T, escStr, textOf, truthy, pr, hasOwn));
-        else renderNodesFb(t.nodes, V, L, out, depth + 1, T);
+        if (typeof t === 'function') out.push(t(V, L, depth + 1, T, escStr, textOf, truthy, pr, hasOwn, C));
+        else renderNodesFb(t.nodes, V, L, out, depth + 1, T, C);
       }
     }
   }
-}
-
-/** Count words (runs of non-whitespace) exactly as (s.match(/\S+/g)||[]).length. */
-const WS_SLASH_S = /\s\S/g;
-function wordCount(s) {
-  if (s.length === 0) return 0;
-  const m = s.match(WS_SLASH_S);
-  let n = m === null ? 0 : m.length;
-  if (!/\s/.test(s[0])) n++;
-  return n;
 }
 
 // ---------------------------------------------------------------- Pipeline
@@ -902,26 +1017,33 @@ export function run(input) {
   const slugMemo = new Map();
   const report = [];
   const templates = Object.create(null);
+  // Parse all templates first: include caching needs every template's nodes
+  // before any of them is compiled.
+  const parsed = Object.create(null);
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      const nodes = parseTemplate(name, input.templates[name]);
-      try {
-        templates[name] = compileTemplate(nodes);
-      } catch (e) {
-        templates[name] = { nodes };
-      }
+      parsed[name] = parseTemplate(name, input.templates[name]);
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
     }
   }
+  for (const name of Object.keys(parsed).sort(byCodeUnits)) {
+    try {
+      templates[name] = compileTemplate(parsed[name], parsed);
+    } catch (e) {
+      templates[name] = { nodes: parsed[name] };
+    }
+  }
+  // Per-run include-output cache (never shared across cases).
+  const incCache = Object.create(null);
   const render = (name, V) => {
     const t = templates[name];
     if (t === undefined) return null;
     const L = Object.create(null);
-    if (typeof t === 'function') return t(V, L, 0, templates, escStr, textOf, truthy, pr, hasOwn);
+    if (typeof t === 'function') return t(V, L, 0, templates, escStr, textOf, truthy, pr, hasOwn, incCache);
     const out = [];
-    renderNodesFb(t.nodes, V, L, out, 0, templates);
+    renderNodesFb(t.nodes, V, L, out, 0, templates, incCache);
     return out.join('');
   };
 
@@ -1025,6 +1147,7 @@ export function run(input) {
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
+    s.words = md.words;
   }
 
   const posts = kept.filter((s) => s.post);
@@ -1081,7 +1204,7 @@ export function run(input) {
       date_long: s.data.date === undefined ? '' : longDate(s.data.date),
       summary: s.data.summary !== undefined ? s.data.summary : '',
       excerpt: s.excerpt,
-      reading_minutes: Math.max(1, Math.ceil((wordCount(s.body)) / 200)),
+      reading_minutes: Math.max(1, Math.ceil(s.words / 200)),
       tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
     };
     cardCache.set(s, c);
