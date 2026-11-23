@@ -1,4 +1,4 @@
-// site-generator-speed-01 entry B v4: fast reimplementation of makefun-site 1.0.0.
+// site-generator-speed-01 entry B v5: fast reimplementation of makefun-site 1.0.0.
 // Dependency-free ES module. Strategies: template codegen via `new Function`
 // (string-concat accumulator; flat op-list interpreter fallback if codegen
 // ever throws), single-pass Markdown over index ranges, hand-scanned front
@@ -13,6 +13,12 @@
 // factored into a shared runtime helper (incTpl) so `new Function` compiles
 // less code; only reachable templates are compiled (reachableTemplates over
 // kept layouts + index/tag/tags and their transitive includes).
+// v5 optimisations over v4: codegen reads V directly for names provably
+// never in L (callerBoundSets fixpoint over the include graph — a naive
+// V-direct for ALL names breaks includes reading caller loop vars, see
+// BUILD-V5.md); escStr fast path is one regex test; slugify ASCII path is
+// run-based and single-pass (bails to the NFKD path on first non-ASCII
+// char); fence code blocks escape via escStr instead of escInto.
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
   'August', 'September', 'October', 'November', 'December'];
@@ -20,10 +26,11 @@ const hasOwn = Object.hasOwn;
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 const ESC_RE = /[&<>"']/g;
+const ESC_TEST = /[&<>"']/;
 
-/** HTML-escape `s` to a new string. Short strings take an indexOf fast path. */
+/** HTML-escape `s` to a new string. Short strings take a regex fast path. */
 export function escStr(s) {
-  if (s.length < 64 && s.indexOf('&') === -1 && s.indexOf('<') === -1 && s.indexOf('>') === -1 && s.indexOf('"') === -1 && s.indexOf("'") === -1) return s;
+  if (s.length < 64 && !ESC_TEST.test(s)) return s;
   let out = '', last = 0, m;
   ESC_RE.lastIndex = 0;
   while ((m = ESC_RE.exec(s)) !== null) {
@@ -34,59 +41,50 @@ export function escStr(s) {
   return last === 0 ? s : out + s.slice(last);
 }
 
-/** Push HTML-escaped s[a..b) onto `out` (chunked, no per-char pushes). */
-function escInto(out, s, a, b) {
-  if (b - a <= 0) return;
-  const sub = b - a === s.length ? s : s.slice(a, b);
-  let last = 0, m;
-  ESC_RE.lastIndex = 0;
-  while ((m = ESC_RE.exec(sub)) !== null) {
-    const i = m.index, c = sub.charCodeAt(i);
-    if (i > last) out.push(sub.slice(last, i));
-    out.push(c === 38 ? '&amp;' : c === 60 ? '&lt;' : c === 62 ? '&gt;' : c === 34 ? '&quot;' : '&#39;');
-    last = i + 1;
+/** Non-ASCII slug path (reference: NFKD, drop combining marks). */
+function slugifyUnicode(text) {
+  const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
+  let out = '', gap = false;
+  for (const ch of plain) {
+    let keep = null;
+    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
+    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
+    if (keep === null) { gap = out.length > 0; continue; }
+    if (gap) out += '-';
+    gap = false;
+    out += keep;
   }
-  if (last === 0) out.push(sub);
-  else if (last < sub.length) out.push(sub.slice(last));
+  out = out.slice(0, 64);
+  let e = out.length;
+  while (e > 0 && out[e - 1] === '-') e--;
+  out = out.slice(0, e);
+  return out === '' ? 'untitled' : out;
 }
 
 /** The slug of `text`, exactly as the reference (NFKD, drop combining marks,
-// A-Z lowered, runs of other chars one '-', cut to 64, 'untitled' if empty). */
+// A-Z lowered, runs of other chars one '-', cut to 64, 'untitled' if empty).
+// Single pass: the run scan bails to the unicode path on the first
+// non-ASCII char instead of pre-scanning the whole string. */
 function slugifyRaw(text) {
-  let ascii = true;
-  for (let i = 0; i < text.length; i++) {
-    if (text.charCodeAt(i) > 127) { ascii = false; break; }
+  // ASCII fast path: slice maximal alnum runs (lowercased) and join with '-'.
+  const parts = [];
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    let c = text.charCodeAt(i);
+    if (c > 127) return slugifyUnicode(text);
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57)) {
+      let j = i + 1;
+      while (j < n) {
+        c = text.charCodeAt(j);
+        if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57))) break;
+        j++;
+      }
+      parts.push(text.slice(i, j).toLowerCase());
+      i = j;
+    } else i++;
   }
-  if (!ascii) {
-    const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
-    let out = '', gap = false;
-    for (const ch of plain) {
-      let keep = null;
-      if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-      else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-      if (keep === null) { gap = out.length > 0; continue; }
-      if (gap) out += '-';
-      gap = false;
-      out += keep;
-    }
-    out = out.slice(0, 64);
-    let e = out.length;
-    while (e > 0 && out[e - 1] === '-') e--;
-    out = out.slice(0, e);
-    return out === '' ? 'untitled' : out;
-  }
-  let out = '', gap = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    let keep = -1;
-    if (c >= 65 && c <= 90) keep = c + 32;
-    else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
-    if (keep === -1) { gap = out.length > 0; continue; }
-    if (gap) out += '-';
-    gap = false;
-    out += String.fromCharCode(keep);
-  }
-  out = out.slice(0, 64);
+  let out = parts.join('-').slice(0, 64);
   let e = out.length;
   while (e > 0 && out.charCodeAt(e - 1) === 45) e--;
   out = out.slice(0, e);
@@ -579,9 +577,7 @@ function renderMarkdown(src, env, slugMemo) {
         fB = lb;
       }
       const cls = lang === '' ? '' : ' class="language-' + escStr(lang) + '"';
-      const codeParts = [];
-      if (fA !== -1) { escInto(codeParts, src, fA, fB); codeParts.push('\n'); }
-      blocks.push('<pre><code' + cls + '>' + codeParts.join('') + '</code></pre>');
+      blocks.push('<pre><code' + cls + '>' + (fA === -1 ? '' : escStr(src.slice(fA, fB)) + '\n') + '</code></pre>');
       continue;
     }
     const hd = c0 === 35 ? headingOf(src, la, lb) : null;
@@ -932,18 +928,68 @@ function reachableTemplates(parsed, roots) {
   return seen;
 }
 
+/** Names that may be present in L when template `name` renders, coming from
+ *  a caller (for-vars bound at an include site, transitively). L starts
+ *  empty for root renders and only for-loops bind names, so a name outside
+ *  this set (and outside the template's own bound stack) can never be in L
+ *  and codegen may read V directly. 'loop' is included when the template
+ *  can be included from inside a for. Fixpoint over the include graph
+ *  (cycles possible; sets only grow). */
+function callerBoundSets(parsed) {
+  const edges = []; // { from, to, bound: Set }
+  const walk = (list, bound, from) => {
+    for (const n of list) {
+      if (n.kind === 'for') {
+        const nb = new Set(bound); nb.add(n.name); nb.add('loop');
+        walk(n.body, nb, from);
+      } else if (n.kind === 'if') {
+        walk(n.then, bound, from);
+        if (n.else !== null) walk(n.else, bound, from);
+      } else if (n.kind === 'include') {
+        edges.push({ from, to: n.name, bound: new Set(bound) });
+      }
+    }
+  };
+  for (const name of Object.keys(parsed)) walk(parsed[name], new Set(), name);
+  const cb = new Map();
+  for (const name of Object.keys(parsed)) cb.set(name, new Set());
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const e of edges) {
+      const to = cb.get(e.to);
+      if (to === undefined) continue; // include of an unparsed template renders ''
+      const from = cb.get(e.from);
+      for (const x of e.bound) if (!to.has(x)) { to.add(x); changed = true; }
+      if (from !== undefined) for (const x of from) if (!to.has(x)) { to.add(x); changed = true; }
+    }
+  }
+  return cb;
+}
+
 /** Codegen: compile a node tree to a function (V, L, out, depth, T). */
-function compileTemplate(nodes, parsed) {
+function compileTemplate(nodes, parsed, callerBound) {
   let uid = 0;
   // Emit a path expression. `bound` is the stack of for-var names enclosing
   // this point (innermost last); 'loop' is bound whenever the stack is non-empty.
+  // A name bound locally reads L directly. A name in `callerBound` (bound by
+  // a for in some template that includes this one) may be in L, so it keeps
+  // the hasOwn check. Any other name can never be in L (L starts empty for
+  // root renders; only for-loops bind, and they restore on exit), so it
+  // reads V directly — no hasOwn call or ternary per access.
   const pathExpr = (path, bound) => {
     const first = path[0];
     let expr;
-    if (first === 'loop' ? bound.length > 0 : bound.includes(first)) {
+    if (first === 'loop') {
+      if (bound.length > 0) expr = 'L.loop';
+      else if (callerBound.has('loop')) expr = '(has(L,"loop")?L.loop:V.loop)';
+      else expr = 'V.loop';
+    } else if (bound.includes(first)) {
       expr = 'L.' + first;
-    } else {
+    } else if (callerBound.has(first)) {
       expr = '(has(L,' + JSON.stringify(first) + ')?L.' + first + ':V.' + first + ')';
+    } else {
+      expr = 'V.' + first;
     }
     for (let k = 1; k < path.length; k++) expr = 'pr(' + expr + ',' + JSON.stringify(path[k]) + ')';
     return expr;
@@ -1140,9 +1186,10 @@ export function run(input) {
   const roots = ['index', 'tag', 'tags'];
   for (const s of kept) roots.push(s.layout);
   const reachable = reachableTemplates(parsed, roots);
+  const cbSets = callerBoundSets(parsed);
   for (const name of [...reachable].sort(byCodeUnits)) {
     try {
-      templates[name] = compileTemplate(parsed[name], parsed);
+      templates[name] = compileTemplate(parsed[name], parsed, cbSets.get(name) || new Set());
     } catch (e) {
       templates[name] = { nodes: parsed[name] };
     }
